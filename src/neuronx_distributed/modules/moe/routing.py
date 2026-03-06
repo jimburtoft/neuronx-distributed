@@ -6,7 +6,11 @@ from torch.distributed import ProcessGroup
 import torch.nn.functional as F
 
 from neuronx_distributed.parallel_layers import mappings
-from neuronx_distributed.parallel_layers.parallel_state import get_tensor_model_parallel_group, get_world_group, get_expert_model_parallel_size
+from neuronx_distributed.parallel_layers.parallel_state import (
+    get_tensor_model_parallel_group,
+    get_world_group,
+    get_expert_model_parallel_size,
+)
 
 
 class RouterBase(torch.nn.Module, ABC):
@@ -66,19 +70,30 @@ class RouterBase(torch.nn.Module, ABC):
         if get_expert_model_parallel_size() > 1:
             self.tensor_parallel_group = get_world_group()
         else:
-            self.tensor_parallel_group = tensor_model_parallel_group if \
-                tensor_model_parallel_group is not None else get_tensor_model_parallel_group()
+            self.tensor_parallel_group = (
+                tensor_model_parallel_group
+                if tensor_model_parallel_group is not None
+                else get_tensor_model_parallel_group()
+            )
 
         # Create router
-        self.linear_router = torch.nn.Linear(hidden_size, num_experts, dtype=dtype, device=device, bias=bias)
+        self.linear_router = torch.nn.Linear(
+            hidden_size, num_experts, dtype=dtype, device=device, bias=bias
+        )
         if self.store_transposed_weights:
-            self.weight_T = torch.nn.Parameter(self.linear_router.weight.detach().T.clone())
-        setattr(self.linear_router.weight, "sequence_parallel_enabled", sequence_parallel_enabled)
+            self.weight_T = torch.nn.Parameter(
+                self.linear_router.weight.detach().T.clone()
+            )
+        setattr(
+            self.linear_router.weight,
+            "sequence_parallel_enabled",
+            sequence_parallel_enabled,
+        )
 
     def _if_training_gather_for_sp(self):
         """Determines when to gather from sequence parallel region based on mode.
-            - training: gather router logits before activation
-            - inference: delayed gather expert affinities mask and expert index
+        - training: gather router logits before activation
+        - inference: delayed gather expert affinities mask and expert index
         """
         return self.sequence_parallel_enabled and self.training
 
@@ -147,9 +162,13 @@ class RouterBase(torch.nn.Module, ABC):
 
     def preshard_hook(self, model_state_dict: Dict[str, Any], prefix: str) -> None:
         if self.store_transposed_weights:
-            original_key = prefix.removesuffix("router.weight") + "router.linear_router.weight"
+            original_key = (
+                prefix.removesuffix("router.weight") + "router.linear_router.weight"
+            )
             transposed_key = prefix.removesuffix("router.weight") + "router.weight_T"
-            model_state_dict[transposed_key] = model_state_dict[original_key].detach().transpose(0, 1).clone()
+            model_state_dict[transposed_key] = (
+                model_state_dict[original_key].detach().transpose(0, 1).clone()
+            )
 
 
 class RouterTopK(RouterBase):
@@ -172,6 +191,7 @@ class RouterTopK(RouterBase):
         apply_act_fn_over_topk: bool = False,
         jitter_eps: float = 0.0,
         store_transposed_weights: bool = False,
+        expert_bias_size: Optional[int] = None,
     ):
         super().__init__(
             num_experts=num_experts,
@@ -188,15 +208,27 @@ class RouterTopK(RouterBase):
             store_transposed_weights=store_transposed_weights,
             apply_act_fn_over_topk=apply_act_fn_over_topk,
         )
+        # Optional expert_bias: post-activation additive bias for top-K selection.
+        # When set, bias is added to affinities for expert selection only; routing weights remain unbiased.
+        if expert_bias_size is not None:
+            self.register_buffer(
+                "expert_bias", torch.zeros(expert_bias_size, dtype=torch.float32)
+            )
+        else:
+            self.register_buffer("expert_bias", None)
 
     def forward(self, hidden_states):
         # Get router_logits and expert_affinities
         router_logits = self.get_router_logits(hidden_states)
         if self.apply_act_fn_over_topk:
             expert_affinities = torch.zeros_like(router_logits, dtype=torch.float64)
-            topk_weights, expert_index = torch.topk(router_logits.to(torch.float64), self.top_k, dim=1)
+            topk_weights, expert_index = torch.topk(
+                router_logits.to(torch.float64), self.top_k, dim=1
+            )
             topk_affinities = self.apply_activation_fn(topk_weights)
-            expert_affinities = expert_affinities.scatter_(1, expert_index, topk_affinities)
+            expert_affinities = expert_affinities.scatter_(
+                1, expert_index, topk_affinities
+            )
         else:
             expert_affinities = self.apply_activation_fn(router_logits)
             # For each token, get the top_k experts
@@ -251,7 +283,9 @@ class RouterSinkhorn(RouterBase):
         )
 
         self.sinkhorn_iterations = (
-            sinkhorn_iterations if sinkhorn_iterations is not None else self.DEFAULT_SINKHORN_ITERS
+            sinkhorn_iterations
+            if sinkhorn_iterations is not None
+            else self.DEFAULT_SINKHORN_ITERS
         )
         self.sinkhorn_tol = sinkhorn_tol
 
@@ -267,7 +301,8 @@ class RouterSinkhorn(RouterBase):
                 # Run Sinkhorn for token balancing in fp32 (to account for the discontinuous nature of the routing function, i.e. high
                 # precision error in logits resulting in a large number of misrouted tokens, which cause more sudden degradations in output)
                 sinkroute = self._sinkhorn(
-                    router_logits.detach().to(dtype=torch.float32), num_iters=self.sinkhorn_iterations
+                    router_logits.detach().to(dtype=torch.float32),
+                    num_iters=self.sinkhorn_iterations,
                 )
             else:
                 sinkroute = router_logits.detach()
@@ -310,8 +345,11 @@ class RouterSinkhorn(RouterBase):
             d1_old = d1
 
         if tol is not None:
-            assert float(error) < tol, f"Sinkhorn error {float(error)} exceeds tolerance {tol}"
+            assert float(error) < tol, (
+                f"Sinkhorn error {float(error)} exceeds tolerance {tol}"
+            )
         return d1 * cost * d0.unsqueeze(1)
+
 
 class GroupLimitedRouter(RouterBase):
     """
@@ -337,18 +375,18 @@ class GroupLimitedRouter(RouterBase):
     """
 
     def __init__(
-            self,
-            num_experts: int,
-            top_k: int,
-            hidden_size: int,
-            n_group: int,
-            topk_group: int,
-            sequence_parallel_enabled: bool = False,
-            sequence_dimension: Optional[int] = None,
-            dtype: torch.dtype = torch.float32,
-            device: torch.device = torch.device("cpu"),
-            tensor_model_parallel_group: Optional[ProcessGroup] = None,
-            jitter_eps: float = 0.0,
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        n_group: int,
+        topk_group: int,
+        sequence_parallel_enabled: bool = False,
+        sequence_dimension: Optional[int] = None,
+        dtype: torch.dtype = torch.float32,
+        device: torch.device = torch.device("cpu"),
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        jitter_eps: float = 0.0,
     ):
         super().__init__(
             num_experts=num_experts,
@@ -440,7 +478,7 @@ class GroupLimitedRouter(RouterBase):
             input=torch.zeros_like(group_scores),
             dim=1,
             index=group_idx,
-            src=torch.ones_like(group_scores)
+            src=torch.ones_like(group_scores),
         )
 
     def _expand_group_mask(self, group_mask, batch_size):
@@ -454,6 +492,8 @@ class GroupLimitedRouter(RouterBase):
         Returns:
             torch.Tensor: Expanded mask for individual experts
         """
-        return group_mask.unsqueeze(-1).expand(
-            batch_size, self.n_group, self.num_experts // self.n_group
-        ).reshape(batch_size, -1)
+        return (
+            group_mask.unsqueeze(-1)
+            .expand(batch_size, self.n_group, self.num_experts // self.n_group)
+            .reshape(batch_size, -1)
+        )
