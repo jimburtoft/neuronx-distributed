@@ -48,7 +48,9 @@ def indexed_flatten(input_tensor: nt.tensor,
         row_offsets_start = 0
     else:
         assert N >= E, f"row_offsets size ({N=}) must be bigger than dim0 size of input_tensor ({E=})"
-        row_offsets_start = nl.load(row_offsets_start).reshape((1,1))
+        row_offsets_start_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=row_offsets_start_sb, src=row_offsets_start.reshape((1, 1)))
+        row_offsets_start = row_offsets_start_sb
 
     num_shards = nl.num_programs(0)
     shard_id = nl.program_id(0)

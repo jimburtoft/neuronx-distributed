@@ -1162,17 +1162,17 @@ class ExpertMLPsV2(torch.nn.Module):
                 f_len = f_len,
                 output_len=num_blocks*block_size + T,
                 row_offsets= row_offsets.reshape(-1).to(torch.int32),
-                row_offsets_start = 0,
             )
             token_position_to_id = token_position_to_id_padded[:num_blocks * block_size]
         else:
             # [E/(EP*TP), T] --> [num_blocks * block_size,]
+            row_offsets_start = (tp_rank * E_kernel).reshape(1).to(torch.int32)
             token_position_to_id_padded = indexed_flatten[nl.nc(logical_nc_config)](
                 input_tensor = indices,
                 f_len = f_len,
                 output_len=num_blocks*block_size + T,
                 row_offsets= row_offsets.reshape(-1).to(torch.int32),
-                row_offsets_start = tp_rank*E_kernel,
+                row_offsets_start = row_offsets_start,
             )
             # Aggregate information across TP ranks.
             token_position_to_id = mappings._reduce(
