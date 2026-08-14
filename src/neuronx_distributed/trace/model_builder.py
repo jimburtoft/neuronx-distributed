@@ -1115,6 +1115,26 @@ class ModelBuilder:
         return None
 
     def _should_optimize_layout(self):
+        # Allow users to disable weight-layout optimization globally via the
+        # NXD_SKIP_WEIGHT_LAYOUT_OPTIMIZATION environment variable. When set to
+        # a truthy value ("1", "true", "yes"), both the priority-model layout
+        # transfer to remaining HLOs (`_add_layout_optimization_to_remaining_hlo`)
+        # and the weight-layout-transform NEFF compile
+        # (`_prepare_weight_layout_transform_model`) are turned into no-ops.
+        #
+        # This is a defensive escape hatch for models where the priority-model
+        # layout is incompatible with a non-priority HLO -- for example when a
+        # bespoke prefill kernel introduces layout constraints that the
+        # priority (token-generation) HLO does not exercise, causing the
+        # downstream `hlo-opt --passes convert-inputs-to-optimal-shape`
+        # subprocess to fail or the WLT-NEFF neuronx-cc compile to error out.
+        # The runtime tradeoff is that weights are laid out in their
+        # "as-loaded" shape rather than the compiler-suggested optimal layout,
+        # so loading and per-step inference may be slower; correctness is
+        # unaffected.
+        skip = os.environ.get("NXD_SKIP_WEIGHT_LAYOUT_OPTIMIZATION", "").lower()
+        if skip in ("1", "true", "yes", "on"):
+            return False
         return self._get_priority_hlo_artifact() is not None
 
     def _mark_weight_in_priority_hlo(self, weight_names_to_skip: set):
